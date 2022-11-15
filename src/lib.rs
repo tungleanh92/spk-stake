@@ -76,7 +76,9 @@ impl Contract {
             Some(mut unwrap_info) => {
                 unwrap_info.time_staked = Utc::now().timestamp();
                 unwrap_info.amount_staked += _stake_amount;
-                unwrap_info.reward += Self::pending_reward(&self, _account_id);
+                unwrap_info.reward += Self::pending_reward(&self, _account_id.clone());
+
+                self.stake_info.insert(&_account_id, &unwrap_info);
             }
             None => {
                 let stake_info = StakeInfo {
@@ -125,13 +127,15 @@ impl Contract {
 
         stake_info.amount_staked -= _amount;
         stake_info.time_staked = Utc::now().timestamp();
-        stake_info.reward += Self::pending_reward(&self, _account_id);
+        stake_info.reward += Self::pending_reward(&self, _account_id.clone());
 
         ext_ft_contract::ext(self.token_address.clone())
             .with_static_gas(FT_TRANSFER_GAS)
             .ft_transfer(env::signer_account_id(), U128::from(_amount), None);
 
         self.total_staked -= _amount;
+
+        self.stake_info.insert(&_account_id, &stake_info);
     }
 
     #[payable]
@@ -143,7 +147,7 @@ impl Contract {
         );
         let mut stake_info = self.stake_info.get(&_account_id).unwrap();
 
-        let reward = Self::pending_reward(&self, _account_id);
+        let reward = Self::pending_reward(&self, _account_id.clone());
         require!(reward > 0, "Stake: You have no reward yet!");
 
         ext_ft_contract::ext(self.token_address.clone())
@@ -152,6 +156,8 @@ impl Contract {
 
         stake_info.time_staked = Utc::now().timestamp();
         stake_info.reward = 0;
+
+        self.stake_info.insert(&_account_id, &stake_info);
     }
 
     pub fn pending_reward(&self, _account_id: AccountId) -> u128 {
@@ -184,7 +190,7 @@ impl Contract {
             "Stake: Advisor not stake any tokens!"
         );
         let mut stake_info = self.stake_info.get(&_advisor_id).unwrap();
-        stake_info.reward = self.pending_reward(_advisor_id);
+        stake_info.reward = self.pending_reward(_advisor_id.clone());
         stake_info.time_staked = Utc::now().timestamp();
         match _learner_vote {
             1_u8 => {
@@ -210,5 +216,6 @@ impl Contract {
                 require!(1 != 1, "Stake: Invalid vote!");
             }
         }
+        self.stake_info.insert(&_advisor_id, &stake_info);
     }
 }
