@@ -1,12 +1,11 @@
 use std::ops::Sub;
 
-use chrono::Utc;
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::collections::LookupMap;
 use near_sdk::json_types::U128;
 use near_sdk::{
-    assert_one_yocto, env, ext_contract, near_bindgen, require, AccountId, BorshStorageKey, Gas,
-    PanicOnDefault,
+    assert_one_yocto, env, near_bindgen, require, AccountId, BorshStorageKey, Gas, PanicOnDefault,
+    ONE_NEAR, ONE_YOCTO, PromiseOrValue,
 };
 
 pub const FT_TRANSFER_GAS: Gas = Gas(10_000_000_000_000);
@@ -14,21 +13,10 @@ pub const WITHDRAW_CALLBACK_GAS: Gas = Gas(10_000_000_000_000);
 pub const FAUCET_CALLBACK_GAS: Gas = Gas(10_000_000_000_000);
 
 pub const POINT_ONE_TOKEN: u128 = 100_000_000_000_000_000_000_000; // 0.1 to 24 decimal
-pub const ONE_TOKEN: u128 = 1_000_000_000_000_000_000_000_000;
 pub const DEFAULT_APR: u128 = 5_000_000_000_000_000_000_000_000; // 5%
 
-#[ext_contract(ext_ft_contract)]
-pub trait FungibleTokenCore {
-    fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>);
-    fn ft_transfer_call(
-        &mut self,
-        receiver_id: AccountId,
-        amount: U128,
-        memo: Option<String>,
-        msg: String,
-    );
-    fn ft_resolve_transfer(&mut self, sender_id: AccountId, receiver_id: AccountId, amount: U128);
-}
+pub mod external;
+pub use crate::external::*;
 
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize)]
@@ -43,10 +31,10 @@ pub struct StakeInfo {
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
 pub struct Contract {
+    pub token_address: AccountId,
     pub total_stakers: u128,
     pub total_staked: u128,
     pub stake_info: LookupMap<AccountId, StakeInfo>,
-    pub token_address: AccountId,
 }
 
 #[derive(BorshDeserialize, BorshSerialize, BorshStorageKey)]
@@ -66,15 +54,21 @@ impl Contract {
         }
     }
 
-    #[payable]
-    pub fn stake_token(&mut self, _account_id: AccountId, _stake_amount: u128) {
-        assert_one_yocto();
+    // call ft_transfer_call on token contract to do stake_token fn called by token contract
+    pub fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
+        let _stake_amount = u128::from(amount);
+        let _account_id = sender_id;
         require!(_stake_amount > 0, "Stake: Invalid amount!");
 
         let info = self.stake_info.get(&_account_id);
         match info {
             Some(mut unwrap_info) => {
-                unwrap_info.time_staked = Utc::now().timestamp();
+                unwrap_info.time_staked = Self::now();
                 unwrap_info.amount_staked += _stake_amount;
                 unwrap_info.reward += Self::pending_reward(&self, _account_id.clone());
 
@@ -82,7 +76,7 @@ impl Contract {
             }
             None => {
                 let stake_info = StakeInfo {
-                    time_staked: Utc::now().timestamp(),
+                    time_staked: Self::now(),
                     amount_staked: _stake_amount,
                     reward: 0,
                     apr: DEFAULT_APR,
@@ -94,26 +88,14 @@ impl Contract {
         }
         self.total_staked += _stake_amount;
 
-        ext_ft_contract::ext(self.token_address.clone())
-            .with_static_gas(FT_TRANSFER_GAS)
-            .ft_transfer_call(
-                env::current_account_id(),
-                U128::from(_stake_amount),
-                None,
-                "spk_stake".to_string(),
-            )
-            .then(
-                ext_ft_contract::ext(self.token_address.clone()).ft_resolve_transfer(
-                    env::signer_account_id(),
-                    env::current_account_id(),
-                    U128::from(_stake_amount),
-                ),
-            );
+        return PromiseOrValue::Value(near_sdk::json_types::U128(0));
     }
 
     #[payable]
-    pub fn unstake_token(&mut self, _account_id: AccountId, _amount: u128) {
+    pub fn unstake_token(&mut self, _amount: U128) {
         assert_one_yocto();
+        let _amount = u128::from(_amount);
+        let _account_id = env::signer_account_id();
         require!(
             self.stake_info.contains_key(&_account_id) == true,
             "Stake: You didn't stake any tokens!"
@@ -125,13 +107,14 @@ impl Contract {
         );
         require!(_amount > 0, "Stake: Invalid amount");
 
-        stake_info.amount_staked -= _amount;
-        stake_info.time_staked = Utc::now().timestamp();
-        stake_info.reward += Self::pending_reward(&self, _account_id.clone());
-
         ext_ft_contract::ext(self.token_address.clone())
             .with_static_gas(FT_TRANSFER_GAS)
+            .with_attached_deposit(ONE_YOCTO)
             .ft_transfer(env::signer_account_id(), U128::from(_amount), None);
+
+        stake_info.amount_staked -= _amount;
+        stake_info.time_staked = Self::now();
+        stake_info.reward += Self::pending_reward(&self, _account_id.clone());
 
         self.total_staked -= _amount;
 
@@ -139,8 +122,9 @@ impl Contract {
     }
 
     #[payable]
-    pub fn claim_reward(&mut self, _account_id: AccountId) {
+    pub fn claim_reward(&mut self) {
         assert_one_yocto();
+        let _account_id = env::signer_account_id();
         require!(
             self.stake_info.contains_key(&_account_id) == true,
             "Stake: You didn't stake any tokens!"
@@ -152,9 +136,10 @@ impl Contract {
 
         ext_ft_contract::ext(self.token_address.clone())
             .with_static_gas(FT_TRANSFER_GAS)
+            .with_attached_deposit(ONE_YOCTO)
             .ft_transfer(env::signer_account_id(), U128::from(reward), None);
 
-        stake_info.time_staked = Utc::now().timestamp();
+        stake_info.time_staked = Self::now();
         stake_info.reward = 0;
 
         self.stake_info.insert(&_account_id, &stake_info);
@@ -167,9 +152,10 @@ impl Contract {
         );
         let stake_info = self.stake_info.get(&_account_id).unwrap();
 
-        let time_last = Utc::now().timestamp().sub(stake_info.time_staked);
-        let pending_reward = (stake_info.amount_staked * (time_last as u128) * stake_info.apr)
-            / (31536000 * ONE_TOKEN * 100);
+        let time_last = Self::now().sub(stake_info.time_staked);
+        let pending_reward = (stake_info.amount_staked * (time_last as u128) / (31536000 * 100))
+            * stake_info.apr
+            / ONE_NEAR;
         return pending_reward + stake_info.reward;
     }
 
@@ -181,17 +167,14 @@ impl Contract {
         return self.stake_info.get(&_advisor_id).unwrap().amount_staked;
     }
 
-    #[private]
-    #[payable]
     pub fn update_apr(&mut self, _advisor_id: AccountId, _learner_vote: u8) {
-        assert_one_yocto();
         require!(
             self.stake_info.contains_key(&_advisor_id) == true,
             "Stake: Advisor not stake any tokens!"
         );
         let mut stake_info = self.stake_info.get(&_advisor_id).unwrap();
-        stake_info.reward = self.pending_reward(_advisor_id.clone());
-        stake_info.time_staked = Utc::now().timestamp();
+        stake_info.reward = Self::pending_reward(&self, _advisor_id.clone());
+        stake_info.time_staked = Self::now();
         match _learner_vote {
             1_u8 => {
                 stake_info.apr -= POINT_ONE_TOKEN * 2;
@@ -217,5 +200,10 @@ impl Contract {
             }
         }
         self.stake_info.insert(&_advisor_id, &stake_info);
+    }
+
+    #[private]
+    pub fn now() -> i64 {
+        return env::block_timestamp() as i64;
     }
 }
